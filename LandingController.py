@@ -1,131 +1,203 @@
-import time
 import numpy as np
-import matplotlib.pyplot as plt
-from GLOBALS import GLOBALS as G
-from pyquaternion import Quaternion
-from PID import PID
+import math
 from Telemetry import Telemetry
-from Display import VehicleDisplay
+from Commanding import Commanding
+from Display import *
 from AttitudeControl import AttitudeControl
+from ReferenceTrajectory import ReferenceLandingTrajectory
 from SuicideBurnControl import SuicideBurnControl
-
+from MPC import MPC
+import krpc
 
 
 class LandingController:
 
-    def __init__(self, mission_config, connection, vehicle, launch_frame):
+    def __init__(self, mission_config, connection, vehicle, frames):
 
         self.mission_config = mission_config
         self.connection = connection
         self.vehicle = vehicle
-        self.launch_frame = launch_frame
+        self.frames = frames
 
-        self.display = VehicleDisplay()
-        self.telemetry = Telemetry(self.connection, self.vehicle, self.launch_frame)
+        self.telemetry = Telemetry(self.connection, self.vehicle, self.frames, 'landing')
+        self.commanding = Commanding(self.vehicle)
+        #  self.display = VehicleDisplay('landing', self.telemetry, self.commanding, self.connection, self.frames)
+        self.land_display = None
+
+        self.time_steps = 5
+
+        self.predicted_landing = connection.drawing.add_line((0, 0, 0), (0, 0, 0), frames['landing'].relative)
+        self.predicted_landing.color = (255, 255, 0)
+        self.predicted_landing.thickness = 20
 
     def mission(self):
 
-        target_euler = (0, -90, np.degrees(np.arctan2(-self.telemetry.pos.v[-1][0], -self.telemetry.pos.v[-1][2])))  # This points back to base
-
-        time.sleep(5)
-
-        self.vehicle.control.rcs = True
-        attitude_control = AttitudeControl(self.connection,
-                                           self.vehicle,
-                                           self.telemetry,
-                                           self.launch_frame,
-                                           target_euler=target_euler)
+        attitude_control = self.vehicle.auto_pilot
 
         # Step 1: Flip to Target Thrust Vector
-        while np.linalg.norm([attitude_control.q_error.imaginary[0], attitude_control.q_error.imaginary[1]]) > 0.05 or np.linalg.norm(self.telemetry.ome.v[-1]) > 0.02:
+        self.vehicle.control.rcs = True
+        predicted_landing = self.get_predicted_landing_location()
+        attitude_control.reference_frame = self.frames['landing'].relative
+        attitude_control.disengage()
+        attitude_control.engage()
+        attitude_control.target_direction = (-1, 0, 0)
+        attitude_control.stopping_time = (5, 5, 5)
 
-            target_euler = (0, -90, np.degrees(np.arctan2(-self.telemetry.pos.v[-1][0], -self.telemetry.pos.v[-1][2])))
+        time.sleep(0.5)
 
-            self.telemetry.update(self.vehicle.control)
-            self.display.update(self.telemetry,
-                                attitude_control.roll_pid,
-                                attitude_control.pitch_pid,
-                                attitude_control.yaw_pid)
+        while attitude_control.error > 1:
 
-            roll, pitch, yaw = attitude_control.update(target_euler=target_euler)
+            self.telemetry.update()
 
-            self.vehicle.control.roll = roll
-            self.vehicle.control.pitch = pitch
-            self.vehicle.control.yaw = yaw
+            predicted_landing = self.get_predicted_landing_location()
 
-        # Step 2: Fire to KSP Launch Pad
-        # TODO: Make this a function of predicted end point
-        burn_back_start = time.time()
-        while time.time() - burn_back_start < 25:
+            x_dir = -predicted_landing[0] / np.linalg.norm(predicted_landing)
+            y_dir = -predicted_landing[1] / np.linalg.norm(predicted_landing)
 
-            target_euler = (0, -90, np.degrees(np.arctan2(-self.telemetry.pos.v[-1][0], -self.telemetry.pos.v[-1][2])))
+            attitude_control.target_direction = (x_dir, y_dir, 0)
 
-            self.telemetry.update(self.vehicle.control)
-            self.display.update(self.telemetry,
-                                attitude_control.roll_pid,
-                                attitude_control.pitch_pid,
-                                attitude_control.yaw_pid)
+            self.commanding.update(throttle=0)
 
-            roll, pitch, yaw = attitude_control.update(target_euler=target_euler)
+        # Step 2: Fire to Zero Out Landing
+        print("Slew Achieved")
+        self.commanding.update(0, 0, 0, throttle=0.3)
+        time.sleep(1)
+        while np.linalg.norm(predicted_landing) > 100 and predicted_landing[0] > 0:
 
-            self.vehicle.control.roll = roll
-            self.vehicle.control.pitch = pitch
-            self.vehicle.control.yaw = yaw
-            if time.time() - burn_back_start < 3:  # This lets attitude control stabilize
-                self.vehicle.control.throttle = 0.05
+            self.telemetry.update()
+
+            predicted_landing = self.get_predicted_landing_location()
+
+            x_dir = -predicted_landing[0] / np.linalg.norm(predicted_landing)
+            y_dir = -predicted_landing[1] / np.linalg.norm(predicted_landing)
+
+            attitude_control.target_direction = (x_dir, y_dir, 0)
+
+            if np.linalg.norm(predicted_landing) > 5000:
+                self.commanding.update(throttle=0.3)
             else:
-                self.vehicle.control.throttle = 0.4
-        self.vehicle.control.throttle = 0
+                self.commanding.update(throttle=0.05)
 
-        # Step 3: Wait Until In Atmosphere for Corrections
-        while self.vehicle.flight().surface_altitude > 50000:
+        # Step 3: Wait Until Landing: Point Retrograde
+        self.commanding.update(throttle=0)
+        self.vehicle.control.rcs = False
+        self.predicted_landing.visible = False
+        while self.telemetry.pos.v[-1][2] > 60000:  # Wait to turn on RCS
+            self.telemetry.update()
+        self.vehicle.control.rcs = True
 
-            self.telemetry.update(self.vehicle.control)
-            self.display.update(self.telemetry,
-                                attitude_control.roll_pid,
-                                attitude_control.pitch_pid,
-                                attitude_control.yaw_pid)
+        while self.telemetry.pos.v[-1][2] > 5000:
+            self.telemetry.update()
 
-            roll, pitch, yaw = attitude_control.update(target_euler=(0, 0, 0))
+            retrograde = self.get_retrograde()
+            attitude_control.target_direction = retrograde
 
-            self.vehicle.control.roll = roll
-            self.vehicle.control.pitch = pitch
-            self.vehicle.control.yaw = yaw
+            self.commanding.update(throttle=0)
 
-        # Step 4: Suicide Burn
-        throttle_control = SuicideBurnControl(self.connection,
-                                              self.vehicle,
-                                              self.telemetry,
-                                              self.launch_frame)
-        for brake in self.vehicle.parts.control_surfaces:
-            brake.deployed = True
-        while self.vehicle.flight().surface_altitude > 0:
+        # Step 4: Landing Time
+        self.commanding.update(0, 0, 0, throttle=0)
+        landing_control = SuicideBurnControl(self.connection, self.vehicle, self.telemetry, self.frames)
+        self.land_display = LandingDisplay(self.telemetry, self.commanding, self.connection, self.frames)
+        while self.telemetry.pos.v[-1][2] > 300:
 
-            self.telemetry.update(self.vehicle.control)
-            self.display.update(self.telemetry,
-                                attitude_control.roll_pid,
-                                attitude_control.pitch_pid,
-                                attitude_control.yaw_pid)
+            self.telemetry.update()
+            self.land_display.update(landing_control)
 
-            throttle, desired_pitch_angle, desired_yaw_angle = throttle_control.update()
-            roll, pitch, yaw = attitude_control.update(target_euler=(0, desired_pitch_angle, desired_yaw_angle))
+            throttle = landing_control.update()
 
-            self.vehicle.control.roll = roll
-            self.vehicle.control.pitch = pitch
-            self.vehicle.control.yaw = yaw
-            self.vehicle.control.throttle = throttle
+            retrograde = self.get_retrograde()
+            attitude_control.target_direction = retrograde
 
+            self.commanding.update(throttle=throttle)
 
+        self.commanding.update(0, 0, 0, throttle=0)
 
+        while self.vehicle.situation.name is not 'landed':
 
-        self.vehicle.control.throttle = 0
+            self.telemetry.update()
+            self.land_display.update(landing_control)
+
+            throttle = landing_control.update()
+
+            retrograde = self.get_retrograde()
+            attitude_control.target_direction = (0, 0, 1)
+
+            self.commanding.update(throttle=throttle)
+
+        self.commanding.update(0, 0, 0, throttle=0)
+        self.vehicle.control.rcs = False
+        print(self.telemetry.pos.v[-1][2])
+
         print("Landed")
 
+        input("Press Enter")
 
-    def get_landing_location(self):
-        self.vehicle = self.connection.space_center.active_vessel
-        radius = self.vehicle.orbit.body.equatorial_radius
-        TA = self.vehicle.orbit.true_anomaly_at_radius(radius)
-        TA = TA-np.pi  # look on the negative (descending) side of the orbit
-        impact_time = self.vehicle.orbit.ut_at_true_anomaly(TA)
-        impact_place = self.vehicle.orbit.position_at(impact_time, self.launch_frame)
+    def get_predicted_landing_location(self):
+        x0 = self.telemetry.pos.v[-1][0]
+        y0 = self.telemetry.pos.v[-1][1]
+        z0 = self.telemetry.pos.v[-1][2]
+
+        dx0 = self.telemetry.vel.v[-1][0]
+        dy0 = self.telemetry.vel.v[-1][1]
+        dz0 = self.telemetry.vel.v[-1][2]
+
+        g = -9.81
+
+        t = np.roots([0.5*g, dz0, z0])
+        dt = np.max(t)
+
+        aerodynamic_correction_constant = 1.85
+        # Higher is shorter
+
+        x1 = x0 + dx0*dt * aerodynamic_correction_constant
+        y1 = y0 + dy0*dt * aerodynamic_correction_constant
+
+        self.predicted_landing.start = (x1, y1, -30000)
+        self.predicted_landing.end = (x1, y1, 300000)
+
+        return x1, y1, 0
+
+    def get_retrograde(self):
+        velocity = self.telemetry.vel.v[-1]
+        retrograde = (-velocity[0], -velocity[1], np.abs(velocity[2])) / np.linalg.norm(velocity)
+
+        return retrograde
+
+    def get_mpc_states_targets(self, compensated_trajectory):
+
+        pointing_vector = self.telemetry.rot.v[-1].rotate((1, 0, 0))
+
+        pitch = math.atan2(pointing_vector[0], pointing_vector[2])
+        yaw = math.atan2(pointing_vector[1], pointing_vector[2])
+
+        states = np.transpose(np.array([
+            self.telemetry.pos.v[-1][0],
+            self.telemetry.vel.v[-1][0],
+            self.telemetry.pos.v[-1][1],
+            self.telemetry.vel.v[-1][1],
+            self.telemetry.pos.v[-1][2],
+            self.telemetry.vel.v[-1][2],
+            pitch,
+            self.telemetry.ome.v[-1][1],
+            yaw,
+            self.telemetry.ome.v[-1][2],
+        ]))
+
+        targets = np.array([
+            compensated_trajectory[0, :],
+            compensated_trajectory[1, :],
+            compensated_trajectory[2, :],
+            compensated_trajectory[3, :],
+            compensated_trajectory[4, :],
+            compensated_trajectory[5, :],
+            np.zeros((self.time_steps+1,)),
+            np.zeros((self.time_steps+1,)),
+            np.zeros((self.time_steps+1,)),
+            np.zeros((self.time_steps+1,)),
+        ])
+
+        return states, targets
+
+
+
+

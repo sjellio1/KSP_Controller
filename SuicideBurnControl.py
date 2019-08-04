@@ -1,49 +1,56 @@
 import numpy as np
-from PID import PID
+from AttitudeControl import PID
+import cvxpy as cp
+import matplotlib.pyplot as plt
 
 class SuicideBurnControl:
 
-    def __init__(self, connection, vehicle, telemetry, launch_frame):
+    def __init__(self, connection, vehicle, telemetry, frames):
 
         self.connection = connection
         self.vehicle = vehicle
         self.telemetry = telemetry
-        self.launch_frame = launch_frame
+        self.frames = frames
 
-        self.ready_to_land = False
+        self.z = 0
+        self.dz = 0
 
-        self.max_acceleration = self.vehicle.available_thrust/self.vehicle.mass - 9.82
+        self.p_cont = 0
+        self.d_cont = 0
+
+        self.thrust_pid = PID(0, 0, 0, 0, 1, 1)
 
     def update(self):
 
-        altitude = self.vehicle.flight().surface_altitude
-        if altitude < 10000 and not self.ready_to_land:
-            self.prepare_to_land()
+        self.update_vehicle_properties()
+        if self.telemetry.pos.v[-1][2] < 5:
+            return 0
 
-        throttle = 0
+        flight = self.vehicle.flight()
 
-        # Calculate Desired Thrust Vector
-        velocity = self.telemetry.vel.v[-1]
-        vertical_velocity = velocity[1]
-        y_velocity = velocity[0]
-        z_velocity = -velocity[2]
+        self.z = flight.surface_altitude - 15
+        self.dz = self.telemetry.vel.v[-1][2]
 
-        desired_pitch_angle = np.degrees(np.arctan2(-z_velocity, np.abs(vertical_velocity)))
-        desired_yaw_angle = np.degrees(np.arctan2(-y_velocity, np.abs(vertical_velocity)))
+        x0 = np.array([self.z, self.dz])
 
-        # Calculate Throttle
-        time_to_zero = np.linalg.norm(velocity) / self.max_acceleration
-        stop_distance = np.linalg.norm(velocity) * time_to_zero + 0.5 * self.max_acceleration * time_to_zero * time_to_zero
-        print(stop_distance, altitude)
+        gains = [899.9, 10386]
 
-        if stop_distance > altitude and altitude > 3:
-            throttle = 1
-        else:
-            throttle = 0
+        self.p_cont = -x0[0]*gains[0]
+        self.d_cont = -x0[1]*gains[1]
 
-        return throttle, desired_pitch_angle, desired_yaw_angle
+        lqr_thrust = self.p_cont + self.d_cont
+        gravity_thrust = self.vehicle.mass * 9.81
 
-    def prepare_to_land(self):
-        for leg in self.vehicle.parts.legs:
-            leg.deployed = True
-            self.ready_to_land = True
+        print(flight.surface_altitude, lqr_thrust, gravity_thrust)
+
+        thrust = lqr_thrust + gravity_thrust
+
+        throttle = thrust / self.vehicle.available_thrust
+
+        throttle = np.clip(throttle, 0, 1)
+
+        return throttle
+
+    def update_vehicle_properties(self):
+
+        self.max_accel = self.vehicle.available_thrust / self.vehicle.mass
